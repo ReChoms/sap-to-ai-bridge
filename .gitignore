@@ -1,0 +1,9 @@
+# Generated binaries
+/target/
+
+# Data files (Kaggle datasets should not be committed)
+/data/
+src/data/
+
+# Vector Database (generated files)
+/lancedb_data/
