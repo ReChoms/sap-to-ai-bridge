@@ -5447,6 +5447,7 @@ dependencies = [
  "candle-transformers",
  "clap",
  "csv",
+ "futures",
  "lancedb",
  "reqwest 0.11.27",
  "serde",

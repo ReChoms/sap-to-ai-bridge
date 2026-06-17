@@ -289,7 +289,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Commands::Ask { query } => {
             println!(">>> Executing ASK command with query: {}", query);
-            println!("(Query logic will be built here in Step 3)");
+            
+            // TODO: CODE_REVIEW - Review this query block next session
+            // ==========================================
+            // 1. Model Loading
+            // ==========================================
+            println!("Loading embedding model (BAAI/bge-base-en-v1.5)...");
+            let (model, tokenizer) = load_model()?;
+
+            // ==========================================
+            // 2. Query Embedding
+            // ==========================================
+            println!("Embedding search query...");
+            let embeddings = get_embeddings(&[query.clone()], &tokenizer, &model)?;
+            let query_vector = embeddings.into_iter().next().ok_or("Failed to generate embedding")?;
+
+            // ==========================================
+            // 3. LanceDB Connection
+            // ==========================================
+            println!("Connecting to LanceDB...");
+            let db = lancedb::connect("data/sap_vectors").execute().await.map_err(|e| Box::<dyn Error>::from(e.to_string()))?;
+            let table = db.open_table("customers").execute().await.map_err(|e| Box::<dyn Error>::from(e.to_string()))?;
+
+            // ==========================================
+            // 4. Vector Search Execution
+            // ==========================================
+            println!("Executing semantic search...");
+            use futures::StreamExt; // Required to iterate over LanceDB's async stream
+            let mut stream = table.search(&query_vector).limit(5).execute().await.map_err(|e| Box::<dyn Error>::from(e.to_string()))?;
+
+            // ==========================================
+            // 5. Result Presentation
+            // ==========================================
+            println!("\n--- Search Results ---");
+            while let Some(result) = stream.next().await {
+                let batch = result.map_err(|e| Box::<dyn Error>::from(e.to_string()))?;
+                
+                let name_array = batch.column_by_name("name").unwrap().as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+                let city_array = batch.column_by_name("city").unwrap().as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+                let kunnr_array = batch.column_by_name("kunnr").unwrap().as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+                let distance_array = batch.column_by_name("_distance").unwrap().as_any().downcast_ref::<arrow_array::Float32Array>().unwrap();
+
+                for i in 0..batch.num_rows() {
+                    let name = name_array.value(i);
+                    let city = city_array.value(i);
+                    let kunnr = kunnr_array.value(i);
+                    let distance = distance_array.value(i);
+                    
+                    println!("Distance: {:.4} | [{}] {} ({})", distance, kunnr, name, city);
+                }
+            }
         }
     }
 
