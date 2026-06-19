@@ -12,6 +12,7 @@ use arrow_schema::{Field, Schema, DataType};
 use arrow_array::{RecordBatch, StringArray, FixedSizeListArray, RecordBatchIterator};
 use arrow_array::builder::{PrimitiveBuilder, FixedSizeListBuilder};
 use arrow_array::types::Float32Type;
+use lancedb::query::{ExecutableQuery, QueryBase};
 
 #[derive(Parser)]
 #[command(name = "sap-to-ai-bridge")]
@@ -316,7 +317,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // ==========================================
             println!("Executing semantic search...");
             use futures::StreamExt; // Required to iterate over LanceDB's async stream
-            let mut stream = table.search(&query_vector).limit(5).execute().await.map_err(|e| Box::<dyn Error>::from(e.to_string()))?;
+            let mut stream = table.query().nearest_to(query_vector).unwrap().limit(5).execute().await.map_err(|e| Box::<dyn Error>::from(e.to_string()))?;
 
             // ==========================================
             // 5. Result Presentation
