@@ -1,18 +1,20 @@
 use candle_core::{Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs::File;
 use std::path::Path;
 use tokenizers::Tokenizer;
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
+use std::collections::HashSet;
 use arrow_schema::{Field, Schema, DataType};
-use arrow_array::{RecordBatch, StringArray, FixedSizeListArray, RecordBatchIterator};
+use arrow_array::{RecordBatch, StringArray, RecordBatchIterator, Array};
 use arrow_array::builder::{PrimitiveBuilder, FixedSizeListBuilder};
 use arrow_array::types::Float32Type;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use datafusion::prelude::*;
 
 #[derive(Parser)]
 #[command(name = "sap-to-ai-bridge")]
@@ -36,6 +38,16 @@ enum Commands {
     /// Query the Vector Database using natural language
     Ask {
         /// The semantic question (e.g. "Find customers in Germany")
+        query: String,
+    },
+    /// Execute a raw SQL query against the SAP data (Zero-ETL)
+    AskSql {
+        /// The SQL query to execute
+        query: String,
+    },
+    /// AI-Generated Hybrid Query (Dynamically routes to SQL or Semantic Search)
+    AskAiSql {
+        /// The natural language question
         query: String,
     },
 }
@@ -153,6 +165,103 @@ struct Kna1Row {
     land1: Option<String>,
 }
 
+/// ==========================================
+/// STEP 4: BLOCK 2 (LLM CLIENT)
+/// ==========================================
+/// Strict Rust struct mapping for the Ollama JSON request
+#[derive(Serialize)]
+struct OllamaRequest {
+    model: String,
+    prompt: String,
+    stream: bool,
+}
+
+/// Strict Rust struct mapping for the Ollama JSON response
+#[derive(Deserialize)]
+struct OllamaResponse {
+    response: String,
+}
+
+/// Sends a prompt to the local Ollama server running Llama 3.2
+async fn ask_llm(prompt: &str) -> Result<String, Box<dyn Error>> {
+    let req_body = OllamaRequest {
+        model: "llama3.2:latest".to_string(),
+        prompt: prompt.to_string(),
+        stream: false,
+    };
+
+    let client = reqwest::Client::new();
+    let res = client.post("http://localhost:11434/api/generate").json(&req_body).send().await?.json::<OllamaResponse>().await?;
+    Ok(res.response)
+}
+
+/// ==========================================
+/// STEP 4: BLOCK 3 (PROMPT ENGINEERING)
+/// ==========================================
+/// Builds the highly-constrained prompt to force the lightweight LLM 
+/// into an exact JSON format using Few-Shot In-Context Learning.
+fn build_routing_prompt(user_question: &str) -> String {
+    format!(
+        "You are an expert SAP data engineer. Read the user's question and decide if it requires exact SQL or SEMANTIC search.
+
+Database Schema for table `kna1`:
+- kunnr (String): Customer Number / ID
+- name1 (String): Customer Name
+- ort01 (String): City
+- land1 (String): Country Code (e.g., 'US', 'DE')
+
+RULES:
+1. You must ONLY output raw JSON. Do not wrap it in markdown. Do not add conversational text.
+2. The JSON must have two keys: \"route\" (either \"SQL\" or \"SEMANTIC\") and \"query\" (the generated SQL string, or blank).
+
+Examples:
+Q: \"How many customers are in Berlin?\"
+A: {{\"route\": \"SQL\", \"query\": \"SELECT count(*) FROM kna1 WHERE ort01 = 'Berlin'\"}}
+
+Q: \"Show me the names of 5 customers in the US.\"
+A: {{\"route\": \"SQL\", \"query\": \"SELECT name1 FROM kna1 WHERE land1 = 'US' LIMIT 5\"}}
+
+Q: \"Find customers who are large tech manufacturers.\"
+A: {{\"route\": \"SEMANTIC\", \"query\": \"\"}}
+
+User Question: \"{}\"
+A: ",
+        user_question
+    )
+}
+
+/// Strict Rust struct to parse the LLM's dynamic JSON decision
+#[derive(Deserialize, Debug)]
+struct RouterDecision {
+    route: String,
+    query: String,
+}
+
+/// ==========================================
+/// STEP 4: BLOCK 1 (APACHE DATAFUSION)
+/// ==========================================
+/// This function spins up an in-memory SQL engine using Apache DataFusion.
+/// It registers our raw SAP CSV file as a SQL table (Zero-ETL) and runs the query.
+async fn execute_sql_query(query: &str) -> Result<(), Box<dyn Error>> {
+    println!("Spinning up Apache DataFusion Engine (Zero-Copy)...");
+    
+    // Create the execution context
+    let ctx = SessionContext::new();
+    
+    // Register the CSV file as a virtual table named 'kna1'
+    println!("Registering data/kna1.csv as virtual SQL table...");
+    ctx.register_csv("kna1", "data/kna1.csv", CsvReadOptions::new()).await?;
+    
+    // Execute the raw SQL string
+    println!("Executing SQL: {}", query);
+    let df = ctx.sql(query).await?;
+    
+    // Print the formatted results to the terminal
+    df.show().await?;
+    
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // Parse CLI arguments
@@ -163,67 +272,105 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!(">>> Executing INGEST command on file: {}", file);
             let csv_path = file.clone();
 
-    println!("Loading embedding model (BAAI/bge-base-en-v1.5) via pure Rust Candle...");
-    let (model, tokenizer) = load_model()?;
+            println!("Connecting to LanceDB...");
+            let db = lancedb::connect("data/sap_vectors").execute().await.map_err(|e| Box::<dyn Error>::from(e.to_string()))?;
 
-    println!(
-        "DEBUG: I am trying to open the file exactly at: {:?}",
-        csv_path
-    );
+            if *overwrite {
+                println!("Overwrite flag detected. Dropping existing 'customers' table...");
+                let _ = db.drop_table("customers").await;
+            }
 
-    println!("Reading {}...", csv_path);
-    let file = File::open(&csv_path).map_err(|e| {
-        format!(
-            "File load went wrong. Rust shows the following error: {}",
-            e
-        )
-    })?;
+            // ==========================================
+            // 1. Application-Level Deduplication
+            // ==========================================
+            // We query the DB for existing SAP keys (kunnr) BEFORE generating embeddings.
+            // This saves massive CPU cycles by not running the neural network on data we already have.
+            let mut existing_kunnrs = HashSet::new();
+            if let Ok(table) = db.open_table("customers").execute().await {
+                println!("Table exists. Scanning existing records to prevent redundant CPU embeddings...");
+                use futures::StreamExt;
+                if let Ok(mut stream) = table.query().execute().await {
+                    while let Some(batch) = stream.next().await {
+                        if let Ok(batch) = batch {
+                            if let Some(col) = batch.column_by_name("kunnr") {
+                                if let Some(kunnr_array) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+                                    for i in 0..kunnr_array.len() {
+                                        existing_kunnrs.insert(kunnr_array.value(i).to_string());
+                                    }
+                                } else {
+                                    eprintln!("WARNING: 'kunnr' column is not a String. Skipping deduplication batch.");
+                                }
+                            } else {
+                                eprintln!("WARNING: 'kunnr' column missing. Skipping deduplication batch.");
+                            }
+                        }
+                    }
+                }
+            }
 
-    let mut rdr = csv::Reader::from_reader(file);
+            println!("Reading {}...", csv_path);
+            let file = File::open(&csv_path).map_err(|e| {
+                format!(
+                    "File load went wrong. Rust shows the following error: {}",
+                    e
+                )
+            })?;
 
-    let mut documents = Vec::new();
-    let mut records = Vec::new();
+            let mut rdr = csv::Reader::from_reader(file);
 
-    // 1. Parse CSV and build the sentences
-    for result in rdr.deserialize() {
-        // Deserialize CSV row into the Kna1Row struct
-        let record: Kna1Row = result?;
+            let mut documents = Vec::new();
+            let mut records = Vec::new();
 
-        // Handle missing SAP data by providing a default "Unknown" value
-        let kunnr = record.kunnr.unwrap_or_else(|| "Unknown".to_string());
-        let name = record.name1.unwrap_or_else(|| "Unknown".to_string());
-        let city = record.ort01.unwrap_or_else(|| "Unknown".to_string());
-        let country = record.land1.unwrap_or_else(|| "Unknown".to_string());
+            // 1. Parse CSV and build the sentences
+            for result in rdr.deserialize() {
+                // Deserialize CSV row into the Kna1Row struct
+                let record: Kna1Row = result?;
 
-        // Serialize SAP row data into a natural language sentence for the embedding model
-        let sentence = format!(
-            "Customer {} is named {} and is located in {}, {}.",
-            kunnr, name, city, country
-        );
+                // Handle missing SAP data by providing a default "Unknown" value
+                let kunnr = record.kunnr.unwrap_or_else(|| "Unknown".to_string());
 
-        // Retain the formatted sentence and the raw metadata
-        documents.push(sentence.clone());
-        records.push((name, city, kunnr));
+                // FILTER: Skip embedding this row if it's already in the database
+                if existing_kunnrs.contains(&kunnr) {
+                    continue;
+                }
 
-        // Limit ingestion to the first 50 rows for the initial spike
-        if documents.len() >= 50 {
-            break;
-        }
-    }
+                // Add to internal HashSet so we also catch duplicates *inside* the CSV file itself
+                existing_kunnrs.insert(kunnr.clone());
 
-    if documents.is_empty() {
-        println!("No data found.");
-        return Ok(());
-    }
+                let name = record.name1.unwrap_or_else(|| "Unknown".to_string());
+                let city = record.ort01.unwrap_or_else(|| "Unknown".to_string());
+                let country = record.land1.unwrap_or_else(|| "Unknown".to_string());
 
-    println!("Embedding {} rows...", documents.len());
+                // Serialize SAP row data into a natural language sentence for the embedding model
+                let sentence = format!(
+                    "Customer {} is named {} and is located in {}, {}.",
+                    kunnr, name, city, country
+                );
+
+                // Retain the formatted sentence and the raw metadata
+                documents.push(sentence.clone());
+                records.push((name, city, kunnr));
+
+                // Limit ingestion to the first 50 rows for the initial spike
+                if documents.len() >= 50 {
+                    break;
+                }
+            }
+
+            if documents.is_empty() {
+                println!("No new customers found. Exiting early to save CPU cycles.");
+                return Ok(());
+            }
+
+            // ONLY load the massive Hugging Face model if we actually have new data to embed
+            println!("Loading embedding model (BAAI/bge-base-en-v1.5) via pure Rust Candle...");
+            let (model, tokenizer) = load_model()?;
+
+            println!("Embedding {} rows...", documents.len());
     // Generate embeddings for the batch of sentences
     let embeddings = get_embeddings(&documents, &tokenizer, &model)?;
 
-    println!("Connecting to LanceDB and saving vectors...");
-    
-    // Connect to local LanceDB instance in the data folder
-    let db = lancedb::connect("data/sap_vectors").execute().await.map_err(|e| Box::<dyn Error>::from(e.to_string()))?;
+    println!("Saving vectors to LanceDB...");
     
     // Define the Apache Arrow Schema here to enforce strict data types
     let schema = Arc::new(Schema::new(vec![
@@ -264,17 +411,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ],
     ).map_err(|e| Box::<dyn Error>::from(e.to_string()))?;
 
-    if *overwrite {
-        println!("Overwrite flag detected. Dropping existing 'customers' table...");
-        let _ = db.drop_table("customers").await;
-    }
-
     // Create the table or append if it already exists
     let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
     match db.open_table("customers").execute().await {
         Ok(table) => {
-            println!("Table 'customers' already exists. Appending new data...");
-            table.add(batches).execute().await.map_err(|e| Box::<dyn Error>::from(e.to_string()))?;
+            // ==========================================
+            // 2. Database-Level Safety Net
+            // ==========================================
+            // Even though we filtered in memory, we use merge_insert (Upsert) here.
+            // This prevents race conditions if two scripts run simultaneously,
+            // ensuring absolute data integrity at the database hardware layer.
+            println!("Table 'customers' already exists. Inserting new SAP records only...");
+            let mut builder = table.merge_insert(&["kunnr"]);
+            builder.when_not_matched_insert_all();
+            builder.execute(Box::new(batches))
+                .await
+                .map_err(|e| Box::<dyn Error>::from(e.to_string()))?;
         }
         Err(_) => {
             println!("Creating new 'customers' table...");
@@ -326,19 +478,54 @@ async fn main() -> Result<(), Box<dyn Error>> {
             while let Some(result) = stream.next().await {
                 let batch = result.map_err(|e| Box::<dyn Error>::from(e.to_string()))?;
                 
-                let name_array = batch.column_by_name("name").unwrap().as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
-                let city_array = batch.column_by_name("city").unwrap().as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
-                let kunnr_array = batch.column_by_name("kunnr").unwrap().as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
-                let distance_array = batch.column_by_name("_distance").unwrap().as_any().downcast_ref::<arrow_array::Float32Array>().unwrap();
+                // Safely attempt to cast all columns, returning None if any fail
+                let name_arr = batch.column_by_name("name").and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>());
+                let city_arr = batch.column_by_name("city").and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>());
+                let kunnr_arr = batch.column_by_name("kunnr").and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>());
+                let dist_arr = batch.column_by_name("_distance").and_then(|c| c.as_any().downcast_ref::<arrow_array::Float32Array>());
 
-                for i in 0..batch.num_rows() {
-                    let name = name_array.value(i);
-                    let city = city_array.value(i);
-                    let kunnr = kunnr_array.value(i);
-                    let distance = distance_array.value(i);
-                    
-                    println!("Distance: {:.4} | [{}] {} ({})", distance, kunnr, name, city);
+                // Only print the results if ALL columns were safely found and casted
+                if let (Some(names), Some(cities), Some(kunnrs), Some(distances)) = (name_arr, city_arr, kunnr_arr, dist_arr) {
+                    for i in 0..batch.num_rows() {
+                        let name = names.value(i);
+                        let city = cities.value(i);
+                        let kunnr = kunnrs.value(i);
+                        let distance = distances.value(i);
+                        
+                        println!("Distance: {:.4} | [{}] {} ({})", distance, kunnr, name, city);
+                    }
+                } else {
+                    // Log the error to STDERR but don't crash the application!
+                    eprintln!("WARNING: Failed to read database columns. Search results skipped.");
                 }
+            }
+        }
+        Commands::AskSql { query } => {
+            println!(">>> Executing ASK-SQL command with query: {}", query);
+            
+            execute_sql_query(&query).await?;
+        }
+        Commands::AskAiSql { query } => {
+            println!(">>> Executing ASK-AISQL with question: '{}'", query);
+            
+            // 1. Build the constrained prompt
+            let full_prompt = build_routing_prompt(&query);
+            
+            // 2. Ask the LLM to decide the route and generate SQL
+            let raw_json_response = ask_llm(&full_prompt).await?;
+            println!("LLM Raw Response: {}", raw_json_response);
+            
+            // 3. Parse the JSON safely
+            let decision: RouterDecision = serde_json::from_str(&raw_json_response)?;
+            
+            // 4. Route the execution
+            if decision.route == "SQL" {
+                println!("Routing engine detected analytical intent. Executing DataFusion Zero-ETL...");
+                execute_sql_query(&decision.query).await?;
+            } else {
+                println!("Routing engine detected semantic intent. Triggering LanceDB Vector Search...");
+                // For right now, we just print the Semantic message. 
+                // In a production app, we would call the Semantic search logic from Step 3 here.
             }
         }
     }
