@@ -21,3 +21,5 @@ arrow-array = "53.0"
 arrow-schema = "53.0"
 futures = "0.3.32"
 datafusion = "38.0.0"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
